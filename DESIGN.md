@@ -227,7 +227,7 @@ pub enum GraphQuery {
 
 ### `Filter`
 
-Structured predicate type used by `find -filter`, `sed -filter`,
+Structured predicate type used by `find -exec grep`, `sed -filter`,
 `join -filter`, and delete operations. Defined independently of any driver;
 QueryRouter translates to each backend's native filter format.
 
@@ -298,25 +298,25 @@ sed -filter '*' -set '{"active": false}' /db/tables/users
 
 ```
 # Simple equality
-find /db/tables/users -filter '{"name": "Alice"}'
+find /db/tables/users -exec grep '{"name": "Alice"}'
 
 # Comparison
-find /db/tables/users -filter '{"age": {"$gt": 21}}'
+find /db/tables/users -exec grep '{"age": {"$gt": 21}}'
 
 # Combined
-find /db/tables/orders -filter '{"$and": [{"status": "shipped"}, {"total": {"$gte": 100}}]}'
+find /db/tables/orders -exec grep '{"$and": [{"status": "shipped"}, {"total": {"$gte": 100}}]}'
 
 # Nested with OR
-find /db/tables/users -filter '{"$or": [{"role": "admin"}, {"$and": [{"age": {"$gte": 18}}, {"verified": true}]}]}'
+find /db/tables/users -exec grep '{"$or": [{"role": "admin"}, {"$and": [{"age": {"$gte": 18}}, {"verified": true}]}]}'
 
 # In a pipeline
-find /db/tables/users -filter '{"active": true}' | sort -k name | less -N 20
+find /db/tables/users -exec grep '{"active": true}' | sort -k name | less -N 20
 
 # With sed
 sed -filter '{"status": "draft"}' -set '{"status": "published"}' /db/tables/posts
 
 # With delete
-find /db/tables/sessions -filter '{"expired_at": {"$lt": "2024-01-01"}}' -delete
+find /db/tables/sessions -exec grep '{"expired_at": {"$lt": "2024-01-01"}}' -delete
 ```
 
 #### Parsing
@@ -894,7 +894,7 @@ stdout to the next. But naively executing database-backed tools this way is
 wasteful:
 
 ```
-find /db/tables/users -filter '{"age": {"$gt": 21}}' | sort -k name | less -N 20
+find /db/tables/users -exec grep '{"age": {"$gt": 21}}' | sort -k name | less -N 20
 ```
 
 **Naive execution:** fetch all matching rows, sort in memory, take 20.  
@@ -1004,7 +1004,7 @@ When the optimizer hits a stage it can't push down, everything before it
 result materializes to stdout, and remaining stages run client-side.
 
 ```
-find /db/tables/users -filter '...' | sort -k name | wc -l | less -N 20
+find /db/tables/users -exec grep '...' | sort -k name | wc -l | less -N 20
                                       ^^^^^^^^^^^^   ^^^^^^
                                       pushed down    boundary — can't push wc
 ```
@@ -1017,7 +1017,7 @@ Execution plan:
 Contrast with:
 
 ```
-find /db/tables/users -filter '...' | sort -k name | less -N 20
+find /db/tables/users -exec grep '...' | sort -k name | less -N 20
                                       ^^^^^^^^^^^^   ^^^^^^^^^^^
                                       pushed down    pushed down
 ```
@@ -1049,7 +1049,7 @@ the stage stays client-side even if it's before any other boundary.
 > - Should the optimizer be greedy (fold everything it can) or cost-based (estimate whether pushdown is actually faster)?
 > - For vector search, `sort` by similarity score is implicit in the query. Should `sort -k score` be a no-op pushdown, or should it re-sort client-side?
 > - How does pushdown interact with `grep` on vector/graph backends? Text pattern matching may not map cleanly to vector filters.
-> - Can the optimizer span multiple `DbOperation`s? e.g. `find /db/tables/users | find /db/tables/orders -filter '...'` — is this a join, or an error?
+> - Can the optimizer span multiple `DbOperation`s? e.g. `find /db/tables/users | find /db/tables/orders -exec grep '...'` — is this a join, or an error?
 > - Should the `ExecutionPlan` be inspectable? An `explain` command (like SQL EXPLAIN) that shows what pushed down and what didn't would be valuable for debugging.
 > - Where does this live in the crate structure? `dbshell-core` (alongside Session) or a new `dbshell-pipeline` crate?
 
@@ -1081,7 +1081,7 @@ This follows the Unix `set -e` / `set -o pipefail` model.
 #### `ToolResult` on failure
 
 ```rust
-// Pipeline: find /db/tables/users -filter '{"bad json"}' | sort -k name | less -N 20
+// Pipeline: find /db/tables/users -exec grep '{"bad json"}' | sort -k name | less -N 20
 // Result: parse fails at the lead stage
 ToolResult {
     stdout: "",
@@ -1171,10 +1171,10 @@ pub enum Separator {
 
 ```
 # Sequential: insert then query
-echo '{"name":"Alice"}' >> /db/tables/users; find /db/tables/users -filter '{"name":"Alice"}'
+echo '{"name":"Alice"}' >> /db/tables/users; find /db/tables/users -exec grep '{"name":"Alice"}'
 
 # Parallel: two independent reads
-find /db/tables/users -filter '{"active":true}' & find /db/tables/orders -filter '{"status":"open"}'
+find /db/tables/users -exec grep '{"active":true}' & find /db/tables/orders -exec grep '{"status":"open"}'
 
 # Transaction: atomic multi-table write
 begin
@@ -1201,7 +1201,7 @@ after the standard SQL transaction lifecycle. No special paths or magic files.
 begin                                              # Session.begin()
   echo '{"id":1}' >> /db/tables/orders             # INSERT — uses active tx
   sed -filter '{"id":5}' -set '{"stock":9}' ...    # UPDATE — uses active tx
-  find /db/tables/orders -filter '{"id":1}'         # READ — sees uncommitted writes (driver-dependent)
+  find /db/tables/orders -exec grep '{"id":1}'         # READ — sees uncommitted writes (driver-dependent)
 commit                                             # Session.commit()
 ```
 
@@ -1366,7 +1366,7 @@ no practical reason to do so.
 |--------|----------------------------------------------------|
 | `ls`   | `ListCollections`, `ListTables`, `InspectCollection` |
 | `cat`  | `InspectCollection`, `DescribeTable`, `ReadResult`  |
-| `find` | `VectorSearch`, `GraphQuery`, `QueryTable`, `Delete`/`DeleteRows` (with `-delete`) |
+| `find` | `VectorSearch`, `GraphQuery`, `QueryTable`, `Delete`/`DeleteRows` (with `-delete`), filtering via `-exec grep` |
 | `grep` | filtered read over collection, table, or result set |
 | `wc`   | count over `find` stdout                           |
 | `sort` | order results by field (`-k`, `-r`, `-n`)          |
@@ -1383,7 +1383,7 @@ All tools that return data write **JSON lines** to stdout — one JSON object
 per line. This is the universal interchange format across pipes.
 
 ```
-$ find /db/tables/users -filter '{"active": true}' -limit 3
+$ find /db/tables/users -exec grep '{"active": true}' -limit 3
 {"id":1,"name":"Alice","age":30,"active":true}
 {"id":3,"name":"Carol","age":25,"active":true}
 {"id":7,"name":"Grace","age":42,"active":true}
@@ -1407,7 +1407,7 @@ JSON lines is chosen because:
 
 | Flag        | Meaning                                      |
 |-------------|----------------------------------------------|
-| `-filter`   | JSON predicate (maps to `Filter`)            |
+| `-exec`     | Run a tool on results (see below)            |
 | `-label`    | node label (graph only)                      |
 | `-type`     | `record \| node \| edge \| collection`       |
 | `-limit`    | max results                                  |
@@ -1416,6 +1416,32 @@ JSON lines is chosen because:
 | `-columns`  | column projection (relational only)          |
 | `-delete`   | execute `Delete`/`DeleteRows` on matches     |
 | `-dry-run`  | return match count without deleting          |
+
+#### `-exec`
+
+Runs a dbshell tool inline on the results. Modeled after `find -exec` in
+Unix — familiar to any user or agent that knows the standard toolchain.
+
+```
+find /db/tables/users -exec grep '{"age": {"$gt": 21}}'
+find /db/tables/users -exec grep '{"status": "active"}' | sort -k name | less -N 20
+find /db/tables/users -exec grep '{"active": true}' -limit 10
+```
+
+`-exec grep` is the primary filtering mechanism. The pipeline optimizer
+recognizes it and pushes the predicate down to the driver as a server-side
+WHERE clause — it does not actually fetch all rows then filter client-side.
+
+`-exec` is a dbshell builtin, not a shell-out. The optimizer has full
+visibility into the tool and its arguments.
+
+> **Open: Predicate syntax**
+>
+> The JSON DSL (`{"age": {"$gt": 21}}`) works but may not be the most
+> ergonomic option. `awk`-style expressions (`age > 21`, `status == "active"`)
+> may be more natural for agents and humans alike. The predicate syntax is
+> under active consideration — the `Filter` enum is the internal
+> representation regardless of surface syntax.
 
 ### `join` flags
 
@@ -1695,7 +1721,7 @@ One tool: `dbshell_exec`.
     "properties": {
       "command": {
         "type": "string",
-        "description": "The dbshell command to execute, e.g. 'find /db/tables/users -filter {\"active\":true} | sort -k name | less -N 20'"
+        "description": "The dbshell command to execute, e.g. 'find /db/tables/users -exec grep {\"active\":true} | sort -k name | less -N 20'"
       }
     },
     "required": ["command"]
