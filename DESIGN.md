@@ -327,7 +327,7 @@ $ cat /search/tracks/blue suede shoes
 Because the output is JSON lines, it works with the full pipeline:
 
 ```
-cat /search/tracks/blue suede shoes | sort -k score -r | less -N 5
+cat /search/tracks/blue suede shoes | head -5
 cat /search/documents/revenue | grep quarterly | wc -l
 cat /search/tracks/sad piano music > /tmp/playlist
 ```
@@ -514,8 +514,7 @@ for shaping results. Real Unix tools operating on text.
 
 ```
 find /db/tables/users | grep Alice            # text match on stdout
-find /db/tables/users | grep active | sort -k name | head -20
-find /db/tables/users | cut -f name,email     # projection (real cut flag)
+find /db/tables/users | grep active | sort | head -20
 find /db/tables/users | wc -l                 # count
 ```
 
@@ -1120,11 +1119,11 @@ stdout to the next. But naively executing database-backed tools this way is
 wasteful:
 
 ```
-find /db/tables/users | filter 'age > 21' | sort -k name | less -N 20
+find /db/tables/users | filter 'age > 21' | head -20
 ```
 
-**Naive execution:** fetch all matching rows, sort in memory, take 20.  
-**Optimized:** single query with `WHERE age > 21 ORDER BY name LIMIT 20`.
+**Naive execution:** fetch all matching rows, take 20.  
+**Optimized:** single query with `WHERE age > 21 LIMIT 20`.
 
 The goal is to keep the Unix composability while pushing as much work as
 possible into the database. This is the same problem that Polars and Spark
@@ -1149,9 +1148,7 @@ pub struct PipeStage {
 pub enum PushdownCapability {
     /// Cannot be pushed down — always runs client-side (e.g. wc)
     None,
-    /// Can become ORDER BY (sort -k field [-r] [-n])
-    OrderBy { field: String, descending: bool, numeric: bool },
-    /// Can become LIMIT (less -N, head -n)
+    /// Can become LIMIT (head -n)
     Limit { count: u64 },
     /// Can become OFFSET (tail -n +N)
     Offset { count: u64 },
@@ -1159,8 +1156,6 @@ pub enum PushdownCapability {
     GrepFilter { pattern: String },
     /// Can become WHERE clause (filter 'field > value' → comparison)
     FieldFilter(Filter),
-    /// Can become a SELECT projection (cut -f)
-    Projection(Vec<String>),
 }
 ```
 
@@ -1207,21 +1202,17 @@ Which tools can push down, and what they fold into:
 
 | Tool    | Flag/usage      | Pushes down to         | Requires driver support |
 |---------|-----------------|------------------------|------------------------|
-| `sort`  | `-k field`      | `ORDER BY field`       | Relational, Graph      |
-| `sort`  | `-k field -r`   | `ORDER BY field DESC`  | Relational, Graph      |
-| `sort`  | `-k field -n`   | `ORDER BY field` (numeric) | Relational         |
-| `less`  | `-N 20`         | `LIMIT 20`             | All drivers            |
 | `head`  | `-n 20`         | `LIMIT 20`             | All drivers            |
-| `tail`  | `-n +100`       | `OFFSET 100`           | Relational             |
+| `tail`  | `-n +101`       | `OFFSET 100`           | Relational             |
 | `grep`  | `pattern`       | `WHERE field LIKE '%pattern%'` | Relational       |
 | `filter` | `field > value` | `WHERE field > value` | Relational             |
-| `cut`   | `-f col1,col2`  | `SELECT col1, col2`    | Relational             |
 
 Tools that **never** push down (always client-side):
 
 | Tool | Reason |
 |------|--------|
 | `wc` | Aggregation over stdout — needs materialized data |
+| `sort` | Reordering over stdout — needs materialized data |
 | `awk` | Arbitrary transformation — can't express as query |
 | `uniq` | Requires sorted input, operates on text lines |
 | `tee` | Side-effect (writes to file), pass-through |
@@ -1233,27 +1224,14 @@ When the optimizer hits a stage it can't push down, everything before it
 result materializes to stdout, and remaining stages run client-side.
 
 ```
-find /db/tables/users | filter '...' | sort -k name | wc -l | less -N 20
-                                      ^^^^^^^^^^^^   ^^^^^^
-                                      pushed down    boundary — can't push wc
+find /db/tables/users | filter '...' | head -20 | wc -l
+                                       ^^^^^^^   ^^^^^^
+                                       pushed down    boundary — can't push wc
 ```
 
 Execution plan:
-1. **Server:** `SELECT * FROM users WHERE ... ORDER BY name` (sort folded in)
+1. **Server:** `SELECT * FROM users WHERE ... LIMIT 20` (head folded in)
 2. **Client:** `wc -l` runs over stdout
-3. **Client:** `less -N 20` runs over wc output (can't push down — it's past the boundary)
-
-Contrast with:
-
-```
-find /db/tables/users | filter '...' | sort -k name | less -N 20
-                                      ^^^^^^^^^^^^   ^^^^^^^^^^^
-                                      pushed down    pushed down
-```
-
-Execution plan:
-1. **Server:** `SELECT * FROM users WHERE ... ORDER BY name LIMIT 20` (both folded)
-2. **Client:** (empty — fully pushed down)
 
 ### Driver pushdown support
 
@@ -1276,7 +1254,6 @@ the stage stays client-side even if it's before any other boundary.
 > **Open: Pipeline optimization**
 >
 > - Should the optimizer be greedy (fold everything it can) or cost-based (estimate whether pushdown is actually faster)?
-> - For vector search, `sort` by similarity score is implicit in the query. Should `sort -k score` be a no-op pushdown, or should it re-sort client-side?
 > - How does pushdown interact with `grep` on vector/graph backends? Text pattern matching may not map cleanly to vector filters.
 > - Can the optimizer span multiple `DbOperation`s? e.g. `find /db/tables/users | find /db/tables/orders` — is this a join, or an error?
 > - Should the `ExecutionPlan` be inspectable? An `explain` command (like SQL EXPLAIN) that shows what pushed down and what didn't would be valuable for debugging.
@@ -1310,20 +1287,20 @@ This follows the Unix `set -e` / `set -o pipefail` model.
 #### `ToolResult` on failure
 
 ```rust
-// Pipeline: find /db/tables/users | filter 'age >' | sort -k name | less -N 20
-// Result: parse fails at the lead stage
+// Pipeline: find /db/tables/users | filter 'age >' | head -20
+// Result: parse fails at the filter stage
 ToolResult {
     stdout: "",
-    stderr: "find: invalid filter: expected ',' or '}' at line 1 column 12",
+    stderr: "filter: parse error: expected value after '>'",
     exit_code: 6,           // InvalidFilter
     payload: ToolPayload::Empty,
 }
 
-// Pipeline: find /db/tables/users | sort -k nonexistent_field | less -N 20
-// Result: sort fails because field doesn't exist in JSON lines
+// Pipeline: find /db/tables/nonexistent | head -20
+// Result: table not found
 ToolResult {
-    stdout: "",             // partial output discarded
-    stderr: "sort: field 'nonexistent_field' not found in input",
+    stdout: "",
+    stderr: "find: table 'nonexistent' not found",
     exit_code: 1,
     payload: ToolPayload::Empty,
 }
@@ -1379,7 +1356,7 @@ pub enum Separator {
 
 | Operator | Meaning | Example |
 |----------|---------|---------|
-| `\|` | Pipe — connect stdout to next stage's stdin | `find ... \| sort -k name` |
+| `\|` | Pipe — connect stdout to next stage's stdin | `find ... \| grep Alice` |
 | `;` | Sequential — run next after current completes | `echo '...' >> t1; echo '...' >> t2` |
 | `&` | Background — run current in parallel, continue | `find /db/tables/users & find /db/tables/orders` |
 | `begin` | Open transaction block | `begin` |
@@ -1408,7 +1385,7 @@ find /db/tables/users/by_status/active & find /db/tables/orders/by_status/open
 # Transaction: atomic multi-table write
 begin
 echo '{"id":1,"user_id":5,"total":99.00}' >> /db/tables/orders
-find /db/tables/accounts | filter 'id == 5' | sed 's/{"balance":{"$dec":99.00}}/'
+echo '{"id":2,"user_id":5,"total":50.00}' >> /db/tables/orders
 commit
 
 # Mixed: parallel reads, then sequential write
@@ -1429,8 +1406,8 @@ after the standard SQL transaction lifecycle. No special paths or magic files.
 ```
 begin                                              # Session.begin()
   echo '{"id":1}' >> /db/tables/orders             # INSERT — uses active tx
-  find /db/tables/products | filter 'id == 5' | sed 's/{"stock":9}/'   # UPDATE — uses active tx
-  find /db/tables/orders | filter 'id == 1'                # READ — sees uncommitted writes (driver-dependent)
+  echo '{"id":2}' >> /db/tables/orders             # INSERT — uses active tx
+  find /db/tables/orders | filter 'id == 1'        # READ — sees uncommitted writes (driver-dependent)
 commit                                             # Session.commit()
 ```
 
@@ -1531,14 +1508,14 @@ this at parse time:
 
 ```
 begin
-  echo '...' >> /db/tables/orders & sed ... /db/tables/products   # ERROR: & not allowed in transaction
+  echo '...' >> /db/tables/orders & echo '...' >> /db/tables/products   # ERROR: & not allowed in transaction
 commit
 ```
 
 If you need concurrent writes, commit first, then parallelize:
 
 ```
-commit; echo '...' >> /db/tables/orders & sed ... /db/tables/products
+commit; echo '...' >> /db/tables/orders & echo '...' >> /db/tables/products
 ```
 
 > **Open: Transactions and concurrency**
@@ -1599,10 +1576,10 @@ no practical reason to do so.
 | `grep` | text pattern match over stdout (pushes down as LIKE) |
 | `filter` | field-level predicates (pushes down as WHERE clause) |
 | `wc`   | count over `find` stdout                           |
-| `sort` | order results by field (`-k`, `-r`, `-n`)          |
-| `less` | paginated browsing (`-N` page size, cursor nav)    |
+| `sort` | order results (client-side, operates on stdout)    |
+| `head` | limit results (`-n`)                               |
+| `tail` | offset results (`-n +N`)                           |
 | `join` | `JoinTable`                                        |
-| `sed`  | `UpdateRows`                                       |
 | `echo … >>` | `InsertRows` (relational), `Upsert` (vector) |
 | `echo … >`  | `UpsertRows` (PK match, full row replace)     |
 | `ln`   | VFS-local — creates session-scoped symlink          |
@@ -1624,9 +1601,8 @@ $ find /db/tables/users/by_status/active | head -3
 - **`cat` on entity**: JSON object (schema, stats, constraints)
 - **`ls`**: newline-separated names (like real `ls`)
 - **`wc`**: plain integer
-- **`sed`, `echo`**: confirmation message (`updated 3 rows`, `inserted 1 row`)
+- **`echo`**: confirmation message (`inserted 1 row`)
 - **`sort`**: passes through JSON lines, reordered
-- **`less`**: passes through JSON lines, paginated
 
 JSON lines is chosen because:
 - Streamable — each line is independently parseable
@@ -1640,8 +1616,6 @@ All flags mirror real Unix `find`. No custom flags.
 
 | Flag        | Meaning                                              |
 |-------------|------------------------------------------------------|
-| `-type`     | `record \| node \| edge \| collection`               |
-| `-maxdepth` | max results returned                                 |
 | `-delete`   | execute `Delete`/`DeleteRows` on matches             |
 | `-exec`     | run a tool on results (see below)                    |
 
@@ -1650,17 +1624,15 @@ custom flags:
 
 | Instead of        | Use                                          |
 |-------------------|----------------------------------------------|
-| ~~`-columns`~~    | `find ... \| cut -f name,email`              |
 | ~~`-dry-run`~~    | `find ... \| wc -l`                          |
-| ~~`-offset`~~     | `find ... \| tail -n +100`                   |
+| ~~`-offset`~~     | `find ... \| tail -n +101`                   |
 | ~~`-label`~~      | path structure: `find /db/graphs/nodes/Artist` |
 
-**Pagination** is handled by `head`, `tail`, and `less` in pipes:
+**Pagination** is handled by `head` and `tail` in pipes:
 
 ```
 find /db/tables/users | head -20                          # first 20
-find /db/tables/users | tail -n +100 | head -20           # rows 100-119
-find /db/tables/users | less -N 20                        # paginated browsing
+find /db/tables/users | tail -n +101 | head -20           # rows 101-120 (skip 100)
 ```
 
 #### `-exec`
@@ -1671,7 +1643,7 @@ Unix — familiar to any user or agent that knows the standard toolchain.
 ```
 find /db/tables/users -exec grep Alice \;
 find /db/tables/users -exec filter 'age > 21' \;
-find /db/tables/orders -type record -exec grep shipped \; | sort -k total -r
+find /db/tables/orders -exec grep shipped \; | sort -r
 ```
 
 `-exec` is a dbshell builtin, not a shell-out. The optimizer has full
@@ -1768,40 +1740,6 @@ violations (duplicate PK, NOT NULL, FK violations) are reported via stderr
 on the `ToolResult` — the tool exits non-zero but includes the count of
 successfully inserted rows in stdout.
 
-#### `sed` — partial update
-
-`sed` maps to `UpdateRows`. Rows to update are selected via pipe (using
-views, `grep`, or `filter` upstream). `sed` applies the substitution to
-the piped rows.
-
-Like real `sed`, the positional argument is the **expression** — a `s/`
-substitution with the JSON fields to change.
-
-```
-# Update via view (known filter)
-find /db/tables/users/by_role/admin | sed 's/{"active": false}/'
-
-# Update via filter (ad-hoc field predicate)
-find /db/tables/users | filter 'age < 18' | sed 's/{"restricted": true}/'
-
-# Update via grep (text match)
-find /db/tables/posts | grep draft | sed 's/{"status": "published"}/'
-```
-
-`sed` **requires piped input** — it does not accept a bare table path
-without upstream filtering. To update all rows, pipe from `find` directly:
-
-```
-find /db/tables/users | sed 's/{"active": false}/'          # all rows
-```
-
-**Type validation** is handled by the driver on the database side. The tool
-layer does no schema validation — it passes the JSON through. Drivers report
-type mismatches, constraint violations, and FK violations via `DbError`,
-which surfaces as stderr + non-zero exit code.
-
-**stdout** reports the number of rows affected: `updated 3 rows`.
-
 #### Vector writes and auto-embedding
 
 Writing to a vector collection follows the same redirect semantics, but the
@@ -1861,7 +1799,7 @@ not pre-embed.
 > **Open: Write path**
 >
 > - For upsert (`>`), if the table has a composite primary key, does the input JSON need all PK columns present? Or can it match on a subset?
-> - Should `sed` support increment/decrement operations? e.g. `find ... | filter 'id == 1' | sed 's/{"views": {"$inc": 1}}/'` — or is that too MongoDB-specific?
+> - How should row updates (UPDATE) be expressed? The write path currently covers INSERT (`>>`) and UPSERT (`>`), but partial field updates need a tool. Options: a dedicated `update` command, piping filtered results through a transform, or `raw()`.
 > - For vector writes, what happens if the collection's configured dimensions don't match the embedder's output dimensions? Error at write time, or at collection creation time?
 > - Should `Embedder` be configurable per-collection (different models for different collections) or strictly per-session?
 > - How is the "which field to embed" convention established? Collection-level config in `CollectionSpec`? A reserved field name? An explicit flag on `echo`?
@@ -1947,12 +1885,12 @@ impl PgDriver {
 | 4 | VFS schema auto-discovery | Auto on mount vs explicit declaration | TODO |
 | 5 | Persistent cache backend | Redis vs sqlite vs none for v1 | TODO |
 | 6 | `/results/` eviction policy | Session-scoped LRU vs TTL | TODO |
-| 7 | Pagination via `less` | How does `less` translate to driver cursors? Does `find ... \| less` push limit/offset down to the driver, or buffer client-side? | TODO |
-| 8 | Sorting via `sort` | Which `sort` flags to support? (`-k` field, `-r` reverse, `-n` numeric). Should `sort` push ORDER BY to the driver when it's the first pipe stage, or always sort client-side? | TODO |
+| 7 | Pagination | How does cursor-based pagination work across tool calls? `head`/`tail` push LIMIT/OFFSET to the driver, but multi-page browsing needs a cursor mechanism. | TODO |
+| 8 | Sorting | `sort` runs client-side over stdout. Should there be a way to push ORDER BY to the driver, or is client-side sorting sufficient for v1? | TODO |
 | 9 | Relational join support | Dedicated `join` tool with `JoinRequest` and `JoinTable` DbOperation | Decided |
 | 10 | Schema change detection | Invalidate on TTL vs event-driven vs manual refresh | TODO |
 | 11 | Pipe execution model | Lazy pipeline with pushdown optimization (see Pipeline section) | TODO — greedy vs cost-based optimizer |
-| 12 | Write stdin format | JSON lines (`>>` = INSERT, `>` = UPSERT, `sed` = UPDATE) | Decided |
+| 12 | Write stdin format | JSON lines (`>>` = INSERT, `>` = UPSERT). Update mechanism TBD. | TODO |
 | 13 | MCP tool surface | Single `dbshell_exec` tool, streamable HTTP transport | Decided (details deferred) |
 | 14 | Testing strategy | MemoryDriver (unit) + docker-compose (integration), both required in CI | Decided |
 | 15 | Transaction semantics | `begin`/`commit`/`rollback` statements, `DriverTransaction` trait, rollback on drop | Decided |
@@ -1987,7 +1925,7 @@ One tool: `dbshell_exec`.
     "properties": {
       "command": {
         "type": "string",
-        "description": "The dbshell command to execute, e.g. 'find /db/tables/users/by_status/active | sort -k name | head -20'"
+        "description": "The dbshell command to execute, e.g. 'find /db/tables/users/by_status/active | grep Alice | head -20'"
       }
     },
     "required": ["command"]
@@ -2158,7 +2096,7 @@ impl MemoryDriver {
 - Tool implementations (all flags, all redirect modes)
 - `PipelineOptimizer` pushdown rules
 - Transaction semantics (begin/commit/rollback/drop-rollback)
-- Write path (`>>`, `>`, `sed`, `find -delete`)
+- Write path (`>>`, `>`, `find -delete`)
 - Error paths (constraint violations, FK violations, type mismatches)
 
 **What it doesn't test:**
