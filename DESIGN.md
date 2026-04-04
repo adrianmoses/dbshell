@@ -403,8 +403,8 @@ pub trait DbDriver: Send + Sync {
     async fn delete_rows(&self, table: &str, filter: &Filter) -> Result<u64> {
         Err(DbError::Unsupported("relational tables"))
     }
-    async fn join_tables(&self, req: &JoinRequest) -> Result<ResultSet> {
-        Err(DbError::Unsupported("joins"))
+    async fn merge_tables(&self, req: &MergeRequest) -> Result<ResultSet> {
+        Err(DbError::Unsupported("merge"))
     }
 
     // Raw escape hatch — driver-specific, returns JSON
@@ -618,10 +618,9 @@ pub struct OrderBy {
 }
 ```
 
-> **Open: Relational joins**
+> **Open: Relational merges**
 >
-> - v1 does not support structured joins. Agents needing joins should use `raw()`.
-> - Should v2 add a `JoinQuery` type, or a SQL-subset DSL in `find`, or is `raw()` sufficient long-term?
+> - Two-table merges are supported via the `merge` tool. Multi-way merges use chained pipes.
 > - How should foreign key relationships be surfaced? `cat /db/tables/users` could show FK references, but navigating them is another question.
 
 ---
@@ -688,39 +687,37 @@ pub struct ForeignKey {
 }
 ```
 
-### `JoinRequest`
+### `MergeRequest`
 
-Produced by the `join` tool. Describes a two-table join that maps to a SQL
-JOIN. Multi-way joins are expressed as chained pipes — the optimizer may
-merge adjacent `JoinTable` operations into a single multi-table query.
+Produced by the `merge` tool. Describes a two-table merge that maps to a SQL
+JOIN. Multi-way merges are expressed as chained pipes — the optimizer may
+merge adjacent `MergeTable` operations into a single multi-table query.
 
 ```rust
-pub struct JoinRequest {
-    pub left: JoinSide,
-    pub right: JoinSide,
-    pub join_type: JoinType,
-    pub on: JoinCondition,
-    pub output_format: Option<Vec<String>>,  // -o FORMAT (projection)
+pub struct MergeRequest {
+    pub left: MergeSide,
+    pub right: MergeSide,
+    pub merge_type: MergeType,
+    pub on: MergeCondition,
+    pub output_fields: Option<Vec<String>>,  // --fields (projection)
 }
 
-pub struct JoinSide {
+pub struct MergeSide {
     pub table: String,
 }
 
-/// Derived from -a/-v flags, matching real `join` semantics.
-pub enum JoinType {
-    Inner,            // default — no -a flag
-    Left,             // -a 1
-    Right,            // -a 2
-    FullOuter,        // -a 1 -a 2
-    AntiLeft,         // -v 1 (unpairable from left only)
-    AntiRight,        // -v 2 (unpairable from right only)
+pub enum MergeType {
+    Inner,            // default
+    Left,             // --left
+    Right,            // --right
+    FullOuter,        // --full
+    AntiLeft,         // --anti-left (unmatched from left only)
+    AntiRight,        // --anti-right (unmatched from right only)
 }
 
-/// Derived from -1/-2 or -j flags.
-pub struct JoinCondition {
-    pub left_col: String,   // -1 FIELD
-    pub right_col: String,  // -2 FIELD
+pub struct MergeCondition {
+    pub left_col: String,   // --on left_col=right_col
+    pub right_col: String,
 }
 ```
 
@@ -754,7 +751,7 @@ pub enum DbOperation {
     UpsertRows { driver: String, table: String, rows: Vec<serde_json::Value> },
     UpdateRows { driver: String, table: String, filter: Filter, set: serde_json::Value },
     DeleteRows { driver: String, table: String, filter: Filter },
-    JoinTable { driver: String, request: JoinRequest },
+    MergeTable { driver: String, request: MergeRequest },
 
     // Collection management
     CreateCollection { driver: String, spec: CollectionSpec },
@@ -1255,7 +1252,7 @@ the stage stays client-side even if it's before any other boundary.
 >
 > - Should the optimizer be greedy (fold everything it can) or cost-based (estimate whether pushdown is actually faster)?
 > - How does pushdown interact with `grep` on vector/graph backends? Text pattern matching may not map cleanly to vector filters.
-> - Can the optimizer span multiple `DbOperation`s? e.g. `find /db/tables/users | find /db/tables/orders` — is this a join, or an error?
+> - Can the optimizer span multiple `DbOperation`s? e.g. `find /db/tables/users | find /db/tables/orders` — is this a merge, or an error?
 > - Should the `ExecutionPlan` be inspectable? An `explain` command (like SQL EXPLAIN) that shows what pushed down and what didn't would be valuable for debugging.
 > - Where does this live in the crate structure? `dbshell-core` (alongside Session) or a new `dbshell-pipeline` crate?
 
@@ -1520,7 +1517,7 @@ commit; echo '...' >> /db/tables/orders & echo '...' >> /db/tables/products
 
 > **Open: Transactions and concurrency**
 >
-> - Should `&` pipelines share a single `ResultStore` namespace, or should each get an isolated result space that merges on join?
+> - Should `&` pipelines share a single `ResultStore` namespace, or should each get an isolated result space that merges on completion?
 > - Should there be a `wait` builtin to block until all background pipelines complete (like bash `wait`)?
 > - Is there a limit on the number of concurrent `&` pipelines? (Bounded by driver connection pool size?)
 > - Should savepoints be supported within a transaction? (`savepoint sp1` / `rollback sp1`) — useful for partial rollback on error.
@@ -1579,7 +1576,7 @@ no practical reason to do so.
 | `sort` | order results (client-side, operates on stdout)    |
 | `head` | limit results (`-n`)                               |
 | `tail` | offset results (`-n +N`)                           |
-| `join` | `JoinTable`                                        |
+| `merge` | `MergeTable`                                      |
 | `echo … >>` | `InsertRows` (relational), `Upsert` (vector) |
 | `echo … >`  | `UpsertRows` (PK match, full row replace)     |
 | `ln`   | VFS-local — creates session-scoped symlink          |
@@ -1597,7 +1594,7 @@ $ find /db/tables/users/by_status/active | head -3
 {"id":7,"name":"Grace","age":42,"active":true}
 ```
 
-- **`find`, `join`, `grep`**: JSON lines (one row per line)
+- **`find`, `merge`, `grep`**: JSON lines (one row per line)
 - **`cat` on entity**: JSON object (schema, stats, constraints)
 - **`ls`**: newline-separated names (like real `ls`)
 - **`wc`**: plain integer
@@ -1650,70 +1647,72 @@ find /db/tables/orders -exec grep shipped \; | sort -r
 visibility into the tool and its arguments and can push recognized patterns
 down to the driver as server-side WHERE clauses.
 
-### `join` flags
+### `merge` flags
 
-Models the Unix `join` command. All flags mirror real `join`. Takes two
-table paths as positional args.
+`merge` is a dbshell command (not a Unix tool) for combining two tables.
+Takes two table paths as positional args.
 
 ```
-join -1 user_id -2 id /db/tables/orders /db/tables/users
-join -j id /db/tables/orders /db/tables/users                # same field name in both
-join -a 1 -1 user_id -2 id /db/tables/orders /db/tables/users  # LEFT join (print unpairable from file 1)
-join -1 product_id -2 id - /db/tables/products               # stdin as left side
+merge --on user_id=id /db/tables/orders /db/tables/users
+merge --on id /db/tables/orders /db/tables/users                # same field name in both
+merge --left --on user_id=id /db/tables/orders /db/tables/users  # LEFT join
+merge --on product_id=id - /db/tables/products                   # stdin as left side
 ```
 
-| Flag        | Meaning (mirrors real `join`)                            |
-|-------------|----------------------------------------------------------|
-| `-1 FIELD`  | Join on FIELD from file 1 (left table)                   |
-| `-2 FIELD`  | Join on FIELD from file 2 (right table)                  |
-| `-j FIELD`  | Join on FIELD from both files (shorthand when same name) |
-| `-a FILENUM`| Also print unpairable lines from file FILENUM (1 or 2)   |
-| `-v FILENUM`| Only print unpairable lines from file FILENUM            |
-| `-o FORMAT` | Output format — comma-separated `FILENUM.FIELD` list     |
+| Flag              | Meaning                                              |
+|-------------------|------------------------------------------------------|
+| `--on FIELD`      | Join on FIELD (same name in both tables)             |
+| `--on L=R`        | Join on field L from left table, R from right table  |
+| `--left`          | Left join (include unmatched rows from left)         |
+| `--right`         | Right join (include unmatched rows from right)       |
+| `--full`          | Full outer join (include all unmatched rows)         |
+| `--anti-left`     | Only unmatched rows from left table                  |
+| `--anti-right`    | Only unmatched rows from right table                 |
+| `--fields F1,F2`  | Output projection — comma-separated field list       |
 
-**Join types via real `join` flags:**
+**Merge types:**
 
-| SQL equivalent | `join` flags |
+| SQL equivalent | `merge` flag |
 |---|---|
-| `INNER JOIN` | default (no `-a`) |
-| `LEFT JOIN` | `-a 1` |
-| `RIGHT JOIN` | `-a 2` |
-| `FULL OUTER JOIN` | `-a 1 -a 2` |
+| `INNER JOIN` | default (no type flag) |
+| `LEFT JOIN` | `--left` |
+| `RIGHT JOIN` | `--right` |
+| `FULL OUTER JOIN` | `--full` |
 
-**Projection** uses `-o` (real `join` flag), not a custom `-columns`:
-
-```
-join -1 user_id -2 id -o 1.total,2.name /db/tables/orders /db/tables/users
-```
-
-Pre-join filtering is done via pipes — filter before joining:
+**Projection** uses `--fields`:
 
 ```
-find /db/tables/orders/by_status/shipped | join -1 user_id -2 id - /db/tables/users
+merge --on user_id=id --fields total,name /db/tables/orders /db/tables/users
 ```
 
-**Multi-way joins** chain through pipes. `-` (or stdin) as the left table
+Pre-merge filtering is done via pipes — filter before merging:
+
+```
+find /db/tables/orders/by_status/shipped | merge --on user_id=id - /db/tables/users
+```
+
+**Multi-way merges** chain through pipes. `-` (or stdin) as the left table
 means "use the result of the previous stage":
 
 ```
-join -1 user_id -2 id /db/tables/orders /db/tables/users | join -1 product_id -2 id - /db/tables/products
+merge --on user_id=id /db/tables/orders /db/tables/users | merge --on product_id=id - /db/tables/products
 ```
 
-The pipeline optimizer can merge adjacent `JoinTable` operations into a single
-multi-table SQL query when both target the same driver.
+The pipeline optimizer can combine adjacent `MergeTable` operations into a
+single multi-table SQL query when both target the same driver.
 
-**Pipeline interaction:** `join` is always a lead stage (it produces a
-`DbOperation`), never a pushdown fold. When `join` appears mid-pipeline
+**Pipeline interaction:** `merge` is always a lead stage (it produces a
+`DbOperation`), never a pushdown fold. When `merge` appears mid-pipeline
 with `-` as left side, it consumes materialized stdin and initiates a new
 server-side operation — this is a **materialization boundary** followed by
 a new lead stage.
 
-> **Open: Joins**
+> **Open: Merges**
 >
-> - Should multi-column joins be supported? e.g. `-1 user_id -2 id -1 org_id -2 org_id` (repeated flags)?
-> - For chained joins with `-`, should the optimizer attempt to merge them into one query (requires same driver), or always materialize between stages?
-> - How does `join` interact with non-relational drivers? Graph traversal already expresses joins implicitly via edges. Should `join` on graph paths be an error or silently delegate to graph traversal?
-> - What is the column naming strategy when both tables have a column with the same name? Prefix with table name (`users.name`, `orders.name`)? Or require `-o` to disambiguate?
+> - Should multi-column merge conditions be supported? e.g. `--on user_id=id,org_id=org_id`
+> - For chained merges with `-`, should the optimizer attempt to combine them into one query (requires same driver), or always materialize between stages?
+> - How does `merge` interact with non-relational drivers? Graph traversal already expresses joins implicitly via edges. Should `merge` on graph paths be an error or silently delegate to graph traversal?
+> - What is the column naming strategy when both tables have a column with the same name? Prefix with table name (`users.name`, `orders.name`)? Or require `--fields` to disambiguate?
 
 ### Write path
 
@@ -1887,7 +1886,7 @@ impl PgDriver {
 | 6 | `/results/` eviction policy | Session-scoped LRU vs TTL | TODO |
 | 7 | Pagination | How does cursor-based pagination work across tool calls? `head`/`tail` push LIMIT/OFFSET to the driver, but multi-page browsing needs a cursor mechanism. | TODO |
 | 8 | Sorting | `sort` runs client-side over stdout. Should there be a way to push ORDER BY to the driver, or is client-side sorting sufficient for v1? | TODO |
-| 9 | Relational join support | Dedicated `join` tool with `JoinRequest` and `JoinTable` DbOperation | Decided |
+| 9 | Relational merge support | Dedicated `merge` tool with `MergeRequest` and `MergeTable` DbOperation | Decided |
 | 10 | Schema change detection | Invalidate on TTL vs event-driven vs manual refresh | TODO |
 | 11 | Pipe execution model | Lazy pipeline with pushdown optimization (see Pipeline section) | TODO — greedy vs cost-based optimizer |
 | 12 | Write stdin format | JSON lines (`>>` = INSERT, `>` = UPSERT). Update mechanism TBD. | TODO |
