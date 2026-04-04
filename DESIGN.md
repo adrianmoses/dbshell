@@ -81,6 +81,12 @@ pub enum VfsPathKind {
     GraphEdge { edge_type: String },   // cat → property schema + cardinality
     TableRoot,
     Table { name: String },            // cat → column schema + constraints, ls → paginated rows
+    View { table: String, view: String },                       // ls → view parameter values
+    ViewEntry { table: String, view: String, param: String },   // find/cat → pre-filtered results
+    Symlink { name: String },          // resolved transparently to target path
+    SearchRoot,                        // ls → shows collection names
+    SearchCollection { collection: String },  // ls → nothing useful
+    SearchQuery { collection: String, query: String },  // cat → vector search results
     Result { id: ResultId },
     Tmp { name: String },
 }
@@ -92,10 +98,12 @@ pub enum VfsPathKind {
   - `/db/` — database mounts (read-only structure, write-through to drivers)
   - `/results/` — result sets written back by Session
   - `/tmp/` — ephemeral scratch space within a session
+  - `/search/` — vector search by filename (query is the path)
+  - `/links/` — session-scoped symlinks created by the user/agent
 - **Path components:**
 
 ```
-/db/                          # ls → shows vectors/, graphs/
+/db/                          # ls → shows vectors/, graphs/, tables/
 /db/vectors/                  # ls → shows collection names
 /db/vectors/tracks            # cat → schema + stats for tracks collection
 /db/graphs/                   # ls → shows nodes/, edges/
@@ -105,11 +113,246 @@ pub enum VfsPathKind {
 /db/graphs/edges/WROTE        # cat → property schema, count, cardinality
 /db/tables/                   # ls → shows table names
 /db/tables/users              # cat → column schema, constraints, indexes
+/db/tables/orders/by_customer/     # ls → shows available customer IDs (view)
+/db/tables/orders/by_customer/42   # find/cat → orders where customer_id = 42
+/search/                      # ls → shows searchable collection names
+/search/tracks/               # the collection to search
+/search/tracks/blue suede shoes   # cat → vector search results for "blue suede shoes"
 /results/                     # ls → shows last, <uuid>s
 /results/last                 # cat → most recent ResultSet
 /tmp/                         # scratch space
+/links/                       # ls → shows symlinks
+/links/vip-orders             # symlink → /db/tables/orders/by_customer/42
 ```
 
+
+#### Views (predefined filter directories)
+
+Views expose filtered subsets of a table as navigable directory paths.
+They are defined at mount time in configuration — not created dynamically
+during a session. The path parameter is substituted into a filter template
+to produce a `Filter` that the driver executes server-side.
+
+```
+/db/tables/orders/by_customer/42     → SELECT * FROM orders WHERE customer_id = 42
+/db/tables/orders/by_status/shipped  → SELECT * FROM orders WHERE status = 'shipped'
+/db/tables/users/by_role/admin       → SELECT * FROM users WHERE role = 'admin'
+```
+
+Views behave like any other path — `find`, `cat`, `sort`, `less`, pipes,
+and the pipeline optimizer all work transparently. A view path is just
+a `find` with a pre-baked filter.
+
+##### `ViewMount`
+
+```rust
+pub struct ViewMount {
+    /// Name of the view directory (e.g. "by_customer")
+    pub name: String,
+    /// The table this view filters
+    pub table: String,
+    /// The column the path parameter maps to
+    pub filter_column: String,
+    /// Expected type of the parameter (for validation/casting)
+    pub param_type: ParamType,
+}
+
+pub enum ParamType {
+    String,
+    Integer,
+    Uuid,
+}
+```
+
+##### Configuration
+
+Views are declared per-table in the mount configuration, read at session
+startup.
+
+```json
+{
+  "driver": "pg",
+  "connection_string": "postgres://...",
+  "views": [
+    {
+      "table": "orders",
+      "name": "by_customer",
+      "filter_column": "customer_id",
+      "param_type": "integer"
+    },
+    {
+      "table": "orders",
+      "name": "by_status",
+      "filter_column": "status",
+      "param_type": "string"
+    },
+    {
+      "table": "users",
+      "name": "by_role",
+      "filter_column": "role",
+      "param_type": "string"
+    }
+  ]
+}
+```
+
+##### Path resolution
+
+When VirtualFS resolves a `ViewEntry` path:
+
+1. Look up the `ViewMount` by table + view name
+2. Cast the path parameter to the expected `ParamType`
+3. Produce a `Filter::Eq { field: filter_column, value: param }`
+4. Return a `DbOperation::QueryTable` with the filter pre-applied
+
+This means `find /db/tables/orders/by_customer/42 | filter 'total > 100'`
+produces a query with **both** the view filter (`customer_id = 42`) AND the
+`filter` predicate (`total > 100`) — the optimizer combines them into a single
+server-side query when possible.
+
+##### `ls` on views
+
+`ls /db/tables/orders/by_customer/` lists the view directory itself —
+showing that this is a parameterized path. It does **not** enumerate all
+possible parameter values (that would require a `SELECT DISTINCT` which
+could be expensive on large tables).
+
+`ls /db/tables/orders/` shows both the table's regular tools and any
+configured views as subdirectories:
+
+```
+$ ls /db/tables/orders/
+by_customer/
+by_status/
+```
+
+> **Open: Views**
+>
+> - Should views support composite keys? e.g. `/db/tables/orders/by_customer_and_status/42/shipped` — two path segments mapping to two filter columns.
+> - Should there be a way to list views across all tables? e.g. `ls /db/views/` as an index.
+> - Can views be defined on vector collections and graph entities, or tables only?
+
+#### Symlinks
+
+Symlinks are session-scoped aliases created by the user or agent via `ln -s`.
+They provide shortcuts to frequently accessed paths — including view paths.
+
+```
+ln -s /db/tables/orders/by_customer/42 /links/vip-orders
+ln -s /db/tables/users/by_role/admin /links/admins
+ln -s /db/tables/products /links/catalog
+```
+
+After creation, the symlink is usable anywhere a path is accepted:
+
+```
+find /links/vip-orders | filter 'total > 100'
+cat /links/admins | wc -l
+echo '{"name":"Widget"}' >> /links/catalog
+```
+
+##### Storage
+
+Symlinks are stored in a `HashMap<String, VfsPath>` on `VirtualFS`.
+They are session-scoped — created during a session, lost on disconnect.
+
+```rust
+pub struct VirtualFS {
+    mounts: MountRegistry,
+    results: ResultBuffer,
+    symlinks: HashMap<String, VfsPath>,  // link name → target path
+}
+```
+
+##### Resolution
+
+`VirtualFS::resolve()` checks symlinks first. If the path starts with
+`/links/<name>`, the target `VfsPath` is substituted before normal
+resolution continues. Symlinks resolve one level only — a symlink
+pointing to another symlink is an error (no chains in v1).
+
+##### `ln` tool
+
+| Flag | Meaning |
+|------|---------|
+| `-s` | Create symbolic link (required — hard links don't make sense in a VFS) |
+
+```
+ln -s <target_path> <link_path>
+```
+
+- `<link_path>` must start with `/links/` — symlinks live in a dedicated namespace.
+- `<target_path>` is validated to be a resolvable VFS path at creation time.
+- Creating a link with an existing name overwrites the previous link.
+- `rm /links/<name>` removes the symlink, not the target.
+- `ls /links/` lists all symlinks with their targets (like `ls -l`).
+- `ls -l` on any directory shows symlinks inline with an arrow: `vip-orders -> /db/tables/orders/by_customer/42`
+
+> **Open: Symlinks**
+>
+> - Should symlinks be persistable across sessions via a config file? This would allow teams to share common aliases.
+> - Should symlinks support relative paths (e.g. `ln -s by_customer/42 /links/vip` while cwd is `/db/tables/orders/`)?
+> - Can symlinks point to `/results/` paths? e.g. `ln -s /results/last /links/latest` — useful but the target is mutable.
+
+#### `/search` — vector search as file access
+
+The `/search/` directory makes vector similarity search feel like reading
+a file. The query is the filename — `cat` embeds it and returns results.
+
+```
+cat /search/tracks/blue suede shoes
+cat /search/tracks/mellow jazz piano
+cat /search/documents/quarterly revenue report
+```
+
+##### How it works
+
+1. VFS parses the path: `/search/<collection>/<query>`
+2. `resolve()` produces a `DbOperation::VectorSearch` with:
+   - The collection name from the path
+   - The query text (everything after the collection segment)
+   - The configured `Embedder` generates the vector at dispatch time
+3. The driver executes the similarity search
+4. Results are returned as JSON lines on stdout, ranked by score
+
+```
+$ cat /search/tracks/blue suede shoes
+{"id":"t1","score":0.95,"text":"blue suede shoes","genre":"rock","artist":"Elvis Presley"}
+{"id":"t2","score":0.82,"text":"blue moon","genre":"jazz","artist":"Billie Holiday"}
+{"id":"t3","score":0.71,"text":"suede jacket blues","genre":"blues","artist":"BB King"}
+```
+
+##### Composable with pipes
+
+Because the output is JSON lines, it works with the full pipeline:
+
+```
+cat /search/tracks/blue suede shoes | sort -k score -r | less -N 5
+cat /search/documents/revenue | grep quarterly | wc -l
+cat /search/tracks/sad piano music > /tmp/playlist
+```
+
+##### `ls` on `/search/`
+
+`ls /search/` lists all vector collections that are searchable (collections
+with a configured `Embedder`). `ls /search/tracks/` is a no-op — there
+are no "files" to list, only queries to make.
+
+##### Search options
+
+Default search returns 10 results. Options can be passed as query-like
+suffixes or via `find` for more control:
+
+```
+cat /search/tracks/blue suede shoes              # default: 10 results
+cat /search/tracks/blue suede shoes | head -20   # explicit limit
+```
+
+> **Open: Search**
+>
+> - Should search support metadata filtering? e.g. `cat /search/tracks/blue suede shoes | grep rock` — combines vector similarity with text filtering. Or views: `/search/tracks/by_genre/rock/blue suede shoes`.
+> - How are spaces in the query handled at the parsing level? The path parser needs to treat everything after `/search/<collection>/` as a single query string, not split on spaces.
+> - Should search results include the similarity score as a field, or as metadata outside the JSON payload?
 
 ---
 
@@ -227,13 +470,14 @@ pub enum GraphQuery {
 
 ### `Filter`
 
-Structured predicate type used by `find -exec grep`, `sed -filter`,
-`join -filter`, and delete operations. Defined independently of any driver;
-QueryRouter translates to each backend's native filter format.
+Structured predicate type — the internal representation for row filtering.
+Produced by view path resolution, `grep` pattern parsing, and `filter`
+expressions. Defined independently of any driver; QueryRouter translates
+to each backend's native filter format.
 
 ```rust
 pub enum Filter {
-    All,                               // matches every row — required for intentional full-table sed
+    All,
     Eq { field: String, value: serde_json::Value },
     Gt { field: String, value: serde_json::Value },
     Lt { field: String, value: serde_json::Value },
@@ -250,86 +494,65 @@ pub enum Filter {
 }
 ```
 
-#### JSON filter syntax
+#### How filters are expressed (no custom DSL)
 
-Filters are written as JSON objects in `-filter` arguments. The syntax is
-intentionally JSON because agents already speak JSON natively — every MCP
-tool call is JSON, so there's no new format to learn.
+There is no JSON filter DSL. Filtering is expressed through three mechanisms,
+in order of preference:
 
-**Simple equality** — field/value pairs at the top level are implicit `$eq`:
-
-```json
-{"name": "Alice"}
-{"status": "active", "role": "admin"}
-```
-
-Multiple fields at the same level are implicit `$and`.
-
-**Comparison operators** — nested objects with `$` prefixed keys:
-
-| Operator | Filter variant | Example | SQL equivalent |
-|----------|---------------|---------|----------------|
-| `$eq` | `Eq` | `{"age": {"$eq": 21}}` | `age = 21` |
-| `$ne` | `Ne` | `{"status": {"$ne": "banned"}}` | `status != 'banned'` |
-| `$gt` | `Gt` | `{"age": {"$gt": 21}}` | `age > 21` |
-| `$lt` | `Lt` | `{"price": {"$lt": 10.00}}` | `price < 10.00` |
-| `$gte` | `Gte` | `{"age": {"$gte": 18}}` | `age >= 18` |
-| `$lte` | `Lte` | `{"age": {"$lte": 65}}` | `age <= 65` |
-| `$in` | `In` | `{"status": {"$in": ["active", "pending"]}}` | `status IN ('active', 'pending')` |
-| `$like` | `Like` | `{"name": {"$like": "A%"}}` | `name LIKE 'A%'` |
-| `$null` | `IsNull` | `{"deleted_at": {"$null": true}}` | `deleted_at IS NULL` |
-| `$between` | `Between` | `{"age": {"$between": [18, 65]}}` | `age BETWEEN 18 AND 65` |
-
-**Logical operators** — combine predicates:
-
-```json
-{"$and": [{"age": {"$gte": 18}}, {"status": "active"}]}
-{"$or": [{"role": "admin"}, {"role": "superadmin"}]}
-{"$not": {"status": "banned"}}
-```
-
-**Match all** — the string `"*"` maps to `Filter::All`:
+**1. Directory structure (views)** — for known, repeated access patterns.
+Pre-established column filters configured at mount time. Zero syntax to learn.
 
 ```
-sed -filter '*' -set '{"active": false}' /db/tables/users
+cat /db/tables/orders/by_customer/42          # customer_id = 42
+find /db/tables/users/by_role/admin           # role = 'admin'
+cat /db/tables/orders/by_status/shipped       # status = 'shipped'
 ```
 
-#### Complete examples
+**2. Standard Unix composition** — for ad-hoc text filtering. `grep` for
+pattern matching on JSON lines stdout. `sort`, `head`, `tail`, `wc`, `cut`
+for shaping results. Real Unix tools operating on text.
 
 ```
-# Simple equality
-find /db/tables/users -exec grep '{"name": "Alice"}'
-
-# Comparison
-find /db/tables/users -exec grep '{"age": {"$gt": 21}}'
-
-# Combined
-find /db/tables/orders -exec grep '{"$and": [{"status": "shipped"}, {"total": {"$gte": 100}}]}'
-
-# Nested with OR
-find /db/tables/users -exec grep '{"$or": [{"role": "admin"}, {"$and": [{"age": {"$gte": 18}}, {"verified": true}]}]}'
-
-# In a pipeline
-find /db/tables/users -exec grep '{"active": true}' | sort -k name | less -N 20
-
-# With sed
-sed -filter '{"status": "draft"}' -set '{"status": "published"}' /db/tables/posts
-
-# With delete
-find /db/tables/sessions -exec grep '{"expired_at": {"$lt": "2024-01-01"}}' -delete
+find /db/tables/users | grep Alice            # text match on stdout
+find /db/tables/users | grep active | sort -k name | head -20
+find /db/tables/users | cut -f name,email     # projection (real cut flag)
+find /db/tables/users | wc -l                 # count
 ```
 
-#### Parsing
+The pipeline optimizer can recognize `grep` patterns and push them down to
+the driver as server-side LIKE clauses when possible.
 
-The `-filter` argument is parsed as JSON, then deserialized into a `Filter`
-enum. The parser handles:
-- Bare values → `Eq`
-- `$`-prefixed operators → corresponding variant
-- Multiple top-level keys → implicit `And`
-- `"*"` string → `All`
+**3. `filter` for structured filtering** — a narrow, purpose-built dbshell
+command for field-level predicates that `grep` can't express (comparisons,
+ranges, logical operators). Learnable via `man filter` or `filter --help`.
 
-Invalid JSON or unknown operators produce `DbError::InvalidFilter` with
-a descriptive message on stderr.
+```
+find /db/tables/users | filter 'age > 21'
+find /db/tables/users | filter 'age >= 18 && status == "active"'
+find /db/tables/orders | filter 'total > 100 || priority == "urgent"'
+find /db/tables/users | filter 'name ~ /^A/'
+```
+
+The expression syntax is minimal and readable:
+
+| Expression | Filter variant | SQL equivalent |
+|---|---|---|
+| `field == value` | `Eq` | `field = value` |
+| `field != value` | `Ne` | `field != value` |
+| `field > value` | `Gt` | `field > value` |
+| `field >= value` | `Gte` | `field >= value` |
+| `field < value` | `Lt` | `field < value` |
+| `field <= value` | `Lte` | `field <= value` |
+| `field ~ /pattern/` | `Like` | `field LIKE pattern` |
+| `expr && expr` | `And` | `expr AND expr` |
+| `expr \|\| expr` | `Or` | `expr OR expr` |
+| `!expr` | `Not` | `NOT expr` |
+
+String values are quoted: `status == "active"`. Numeric values are bare:
+`age > 21`. The parser infers types from the quoting.
+
+The pipeline optimizer recognizes `filter` expressions and pushes them down
+to the driver as server-side WHERE clauses.
 
 #### Driver translation
 
@@ -338,13 +561,13 @@ is internal to the driver — `Filter` is the contract, not the query string.
 
 | Driver | Translation target | Notes |
 |--------|-------------------|-------|
-| PgDriver | SQL `WHERE` clause (parameterized) | `$like` maps to `LIKE`, `$in` to `= ANY($1)` |
-| QdrantDriver | `qdrant_client::Filter` + `FieldCondition` | `$like` not supported — returns `InvalidFilter` |
+| PgDriver | SQL `WHERE` clause (parameterized) | `~` maps to `LIKE`, multiple values to `= ANY($1)` |
+| QdrantDriver | `qdrant_client::Filter` + `FieldCondition` | regex not supported — falls back to client-side |
 | SurrealDriver | SurrealQL `WHERE` clause | Full operator support |
 
-Drivers that don't support a given operator return `DbError::InvalidFilter`
-with a message indicating what's unsupported, rather than silently dropping
-the predicate.
+Drivers that don't support a given filter fall back to client-side
+evaluation rather than failing — the optimizer marks the stage as
+non-pushable and it runs over materialized stdout.
 
 ---
 
@@ -477,25 +700,28 @@ pub struct JoinRequest {
     pub left: JoinSide,
     pub right: JoinSide,
     pub join_type: JoinType,
-    pub on: Vec<JoinCondition>,
+    pub on: JoinCondition,
+    pub output_format: Option<Vec<String>>,  // -o FORMAT (projection)
 }
 
 pub struct JoinSide {
     pub table: String,
-    pub filter: Option<Filter>,     // pre-join filter (WHERE before JOIN)
-    pub columns: Option<Vec<String>>, // projection — None means all columns
 }
 
+/// Derived from -a/-v flags, matching real `join` semantics.
 pub enum JoinType {
-    Inner,   // default
-    Left,
-    Right,
-    Cross,
+    Inner,            // default — no -a flag
+    Left,             // -a 1
+    Right,            // -a 2
+    FullOuter,        // -a 1 -a 2
+    AntiLeft,         // -v 1 (unpairable from left only)
+    AntiRight,        // -v 2 (unpairable from right only)
 }
 
+/// Derived from -1/-2 or -j flags.
 pub struct JoinCondition {
-    pub left_col: String,
-    pub right_col: String,
+    pub left_col: String,   // -1 FIELD
+    pub right_col: String,  // -2 FIELD
 }
 ```
 
@@ -894,7 +1120,7 @@ stdout to the next. But naively executing database-backed tools this way is
 wasteful:
 
 ```
-find /db/tables/users -exec grep '{"age": {"$gt": 21}}' | sort -k name | less -N 20
+find /db/tables/users | filter 'age > 21' | sort -k name | less -N 20
 ```
 
 **Naive execution:** fetch all matching rows, sort in memory, take 20.  
@@ -921,16 +1147,18 @@ pub struct PipeStage {
 /// Declares what a tool stage *could* contribute to a server-side query
 /// if folded into the lead stage. Set during parsing, consumed by the optimizer.
 pub enum PushdownCapability {
-    /// Cannot be pushed down — always runs client-side (e.g. wc, awk)
+    /// Cannot be pushed down — always runs client-side (e.g. wc)
     None,
     /// Can become ORDER BY (sort -k field [-r] [-n])
     OrderBy { field: String, descending: bool, numeric: bool },
     /// Can become LIMIT (less -N, head -n)
     Limit { count: u64 },
-    /// Can become OFFSET (less +N, tail -n +N)
+    /// Can become OFFSET (tail -n +N)
     Offset { count: u64 },
-    /// Can become an additional WHERE/filter clause (grep pattern)
-    Filter(Filter),
+    /// Can become WHERE LIKE (grep pattern → text match)
+    GrepFilter { pattern: String },
+    /// Can become WHERE clause (filter 'field > value' → comparison)
+    FieldFilter(Filter),
     /// Can become a SELECT projection (cut -f)
     Projection(Vec<String>),
 }
@@ -985,7 +1213,8 @@ Which tools can push down, and what they fold into:
 | `less`  | `-N 20`         | `LIMIT 20`             | All drivers            |
 | `head`  | `-n 20`         | `LIMIT 20`             | All drivers            |
 | `tail`  | `-n +100`       | `OFFSET 100`           | Relational             |
-| `grep`  | `pattern`       | `WHERE field LIKE/=`   | Relational (via Filter)|
+| `grep`  | `pattern`       | `WHERE field LIKE '%pattern%'` | Relational       |
+| `filter` | `field > value` | `WHERE field > value` | Relational             |
 | `cut`   | `-f col1,col2`  | `SELECT col1, col2`    | Relational             |
 
 Tools that **never** push down (always client-side):
@@ -1004,7 +1233,7 @@ When the optimizer hits a stage it can't push down, everything before it
 result materializes to stdout, and remaining stages run client-side.
 
 ```
-find /db/tables/users -exec grep '...' | sort -k name | wc -l | less -N 20
+find /db/tables/users | filter '...' | sort -k name | wc -l | less -N 20
                                       ^^^^^^^^^^^^   ^^^^^^
                                       pushed down    boundary — can't push wc
 ```
@@ -1017,7 +1246,7 @@ Execution plan:
 Contrast with:
 
 ```
-find /db/tables/users -exec grep '...' | sort -k name | less -N 20
+find /db/tables/users | filter '...' | sort -k name | less -N 20
                                       ^^^^^^^^^^^^   ^^^^^^^^^^^
                                       pushed down    pushed down
 ```
@@ -1049,7 +1278,7 @@ the stage stays client-side even if it's before any other boundary.
 > - Should the optimizer be greedy (fold everything it can) or cost-based (estimate whether pushdown is actually faster)?
 > - For vector search, `sort` by similarity score is implicit in the query. Should `sort -k score` be a no-op pushdown, or should it re-sort client-side?
 > - How does pushdown interact with `grep` on vector/graph backends? Text pattern matching may not map cleanly to vector filters.
-> - Can the optimizer span multiple `DbOperation`s? e.g. `find /db/tables/users | find /db/tables/orders -exec grep '...'` — is this a join, or an error?
+> - Can the optimizer span multiple `DbOperation`s? e.g. `find /db/tables/users | find /db/tables/orders` — is this a join, or an error?
 > - Should the `ExecutionPlan` be inspectable? An `explain` command (like SQL EXPLAIN) that shows what pushed down and what didn't would be valuable for debugging.
 > - Where does this live in the crate structure? `dbshell-core` (alongside Session) or a new `dbshell-pipeline` crate?
 
@@ -1081,7 +1310,7 @@ This follows the Unix `set -e` / `set -o pipefail` model.
 #### `ToolResult` on failure
 
 ```rust
-// Pipeline: find /db/tables/users -exec grep '{"bad json"}' | sort -k name | less -N 20
+// Pipeline: find /db/tables/users | filter 'age >' | sort -k name | less -N 20
 // Result: parse fails at the lead stage
 ToolResult {
     stdout: "",
@@ -1171,15 +1400,15 @@ pub enum Separator {
 
 ```
 # Sequential: insert then query
-echo '{"name":"Alice"}' >> /db/tables/users; find /db/tables/users -exec grep '{"name":"Alice"}'
+echo '{"name":"Alice"}' >> /db/tables/users; find /db/tables/users | grep Alice
 
 # Parallel: two independent reads
-find /db/tables/users -exec grep '{"active":true}' & find /db/tables/orders -exec grep '{"status":"open"}'
+find /db/tables/users/by_status/active & find /db/tables/orders/by_status/open
 
 # Transaction: atomic multi-table write
 begin
 echo '{"id":1,"user_id":5,"total":99.00}' >> /db/tables/orders
-sed -filter '{"id":5}' -set '{"balance":{"$dec":99.00}}' /db/tables/accounts
+find /db/tables/accounts | filter 'id == 5' | sed 's/{"balance":{"$dec":99.00}}/'
 commit
 
 # Mixed: parallel reads, then sequential write
@@ -1200,8 +1429,8 @@ after the standard SQL transaction lifecycle. No special paths or magic files.
 ```
 begin                                              # Session.begin()
   echo '{"id":1}' >> /db/tables/orders             # INSERT — uses active tx
-  sed -filter '{"id":5}' -set '{"stock":9}' ...    # UPDATE — uses active tx
-  find /db/tables/orders -exec grep '{"id":1}'         # READ — sees uncommitted writes (driver-dependent)
+  find /db/tables/products | filter 'id == 5' | sed 's/{"stock":9}/'   # UPDATE — uses active tx
+  find /db/tables/orders | filter 'id == 1'                # READ — sees uncommitted writes (driver-dependent)
 commit                                             # Session.commit()
 ```
 
@@ -1366,8 +1595,9 @@ no practical reason to do so.
 |--------|----------------------------------------------------|
 | `ls`   | `ListCollections`, `ListTables`, `InspectCollection` |
 | `cat`  | `InspectCollection`, `DescribeTable`, `ReadResult`  |
-| `find` | `VectorSearch`, `GraphQuery`, `QueryTable`, `Delete`/`DeleteRows` (with `-delete`), filtering via `-exec grep` |
-| `grep` | filtered read over collection, table, or result set |
+| `find` | `VectorSearch`, `GraphQuery`, `QueryTable`, `Delete`/`DeleteRows` (with `-delete`) |
+| `grep` | text pattern match over stdout (pushes down as LIKE) |
+| `filter` | field-level predicates (pushes down as WHERE clause) |
 | `wc`   | count over `find` stdout                           |
 | `sort` | order results by field (`-k`, `-r`, `-n`)          |
 | `less` | paginated browsing (`-N` page size, cursor nav)    |
@@ -1375,7 +1605,8 @@ no practical reason to do so.
 | `sed`  | `UpdateRows`                                       |
 | `echo … >>` | `InsertRows` (relational), `Upsert` (vector) |
 | `echo … >`  | `UpsertRows` (PK match, full row replace)     |
-| `rm`   | `DropCollection`                                   |
+| `ln`   | VFS-local — creates session-scoped symlink          |
+| `rm`   | `DropCollection`, or remove symlink if `/links/`   |
 
 ### Output formatting
 
@@ -1383,7 +1614,7 @@ All tools that return data write **JSON lines** to stdout — one JSON object
 per line. This is the universal interchange format across pipes.
 
 ```
-$ find /db/tables/users -exec grep '{"active": true}' -limit 3
+$ find /db/tables/users/by_status/active | head -3
 {"id":1,"name":"Alice","age":30,"active":true}
 {"id":3,"name":"Carol","age":25,"active":true}
 {"id":7,"name":"Grace","age":42,"active":true}
@@ -1405,17 +1636,32 @@ JSON lines is chosen because:
 
 ### `find` flags
 
-| Flag        | Meaning                                      |
-|-------------|----------------------------------------------|
-| `-exec`     | Run a tool on results (see below)            |
-| `-label`    | node label (graph only)                      |
-| `-type`     | `record \| node \| edge \| collection`       |
-| `-limit`    | max results                                  |
-| `-offset`   | skip N results (for pagination)              |
-| `-cursor`   | opaque continuation token from previous page |
-| `-columns`  | column projection (relational only)          |
-| `-delete`   | execute `Delete`/`DeleteRows` on matches     |
-| `-dry-run`  | return match count without deleting          |
+All flags mirror real Unix `find`. No custom flags.
+
+| Flag        | Meaning                                              |
+|-------------|------------------------------------------------------|
+| `-type`     | `record \| node \| edge \| collection`               |
+| `-maxdepth` | max results returned                                 |
+| `-delete`   | execute `Delete`/`DeleteRows` on matches             |
+| `-exec`     | run a tool on results (see below)                    |
+
+**Replaced by Unix composition** — these operations use pipes instead of
+custom flags:
+
+| Instead of        | Use                                          |
+|-------------------|----------------------------------------------|
+| ~~`-columns`~~    | `find ... \| cut -f name,email`              |
+| ~~`-dry-run`~~    | `find ... \| wc -l`                          |
+| ~~`-offset`~~     | `find ... \| tail -n +100`                   |
+| ~~`-label`~~      | path structure: `find /db/graphs/nodes/Artist` |
+
+**Pagination** is handled by `head`, `tail`, and `less` in pipes:
+
+```
+find /db/tables/users | head -20                          # first 20
+find /db/tables/users | tail -n +100 | head -20           # rows 100-119
+find /db/tables/users | less -N 20                        # paginated browsing
+```
 
 #### `-exec`
 
@@ -1423,49 +1669,62 @@ Runs a dbshell tool inline on the results. Modeled after `find -exec` in
 Unix — familiar to any user or agent that knows the standard toolchain.
 
 ```
-find /db/tables/users -exec grep '{"age": {"$gt": 21}}'
-find /db/tables/users -exec grep '{"status": "active"}' | sort -k name | less -N 20
-find /db/tables/users -exec grep '{"active": true}' -limit 10
+find /db/tables/users -exec grep Alice \;
+find /db/tables/users -exec filter 'age > 21' \;
+find /db/tables/orders -type record -exec grep shipped \; | sort -k total -r
 ```
 
-`-exec grep` is the primary filtering mechanism. The pipeline optimizer
-recognizes it and pushes the predicate down to the driver as a server-side
-WHERE clause — it does not actually fetch all rows then filter client-side.
-
 `-exec` is a dbshell builtin, not a shell-out. The optimizer has full
-visibility into the tool and its arguments.
-
-> **Open: Predicate syntax**
->
-> The JSON DSL (`{"age": {"$gt": 21}}`) works but may not be the most
-> ergonomic option. `awk`-style expressions (`age > 21`, `status == "active"`)
-> may be more natural for agents and humans alike. The predicate syntax is
-> under active consideration — the `Filter` enum is the internal
-> representation regardless of surface syntax.
+visibility into the tool and its arguments and can push recognized patterns
+down to the driver as server-side WHERE clauses.
 
 ### `join` flags
 
-Models the Unix `join` command. Takes two table paths as positional args.
+Models the Unix `join` command. All flags mirror real `join`. Takes two
+table paths as positional args.
 
 ```
-join /db/tables/orders /db/tables/users -on user_id=id
-join /db/tables/orders /db/tables/users -on user_id=id -type left
-join /db/tables/orders /db/tables/users -on user_id=id -columns orders.total,users.name
-join - /db/tables/products -on product_id=id    # stdin as left side (chained joins)
+join -1 user_id -2 id /db/tables/orders /db/tables/users
+join -j id /db/tables/orders /db/tables/users                # same field name in both
+join -a 1 -1 user_id -2 id /db/tables/orders /db/tables/users  # LEFT join (print unpairable from file 1)
+join -1 product_id -2 id - /db/tables/products               # stdin as left side
 ```
 
-| Flag        | Meaning                                              |
-|-------------|------------------------------------------------------|
-| `-on`       | Join condition: `left_col=right_col` (required)      |
-| `-type`     | `inner` (default), `left`, `right`, `cross`          |
-| `-filter`   | JSON predicate applied before join (pre-join WHERE)  |
-| `-columns`  | Projection — `table.col,...` format, None = all      |
+| Flag        | Meaning (mirrors real `join`)                            |
+|-------------|----------------------------------------------------------|
+| `-1 FIELD`  | Join on FIELD from file 1 (left table)                   |
+| `-2 FIELD`  | Join on FIELD from file 2 (right table)                  |
+| `-j FIELD`  | Join on FIELD from both files (shorthand when same name) |
+| `-a FILENUM`| Also print unpairable lines from file FILENUM (1 or 2)   |
+| `-v FILENUM`| Only print unpairable lines from file FILENUM            |
+| `-o FORMAT` | Output format — comma-separated `FILENUM.FIELD` list     |
+
+**Join types via real `join` flags:**
+
+| SQL equivalent | `join` flags |
+|---|---|
+| `INNER JOIN` | default (no `-a`) |
+| `LEFT JOIN` | `-a 1` |
+| `RIGHT JOIN` | `-a 2` |
+| `FULL OUTER JOIN` | `-a 1 -a 2` |
+
+**Projection** uses `-o` (real `join` flag), not a custom `-columns`:
+
+```
+join -1 user_id -2 id -o 1.total,2.name /db/tables/orders /db/tables/users
+```
+
+Pre-join filtering is done via pipes — filter before joining:
+
+```
+find /db/tables/orders/by_status/shipped | join -1 user_id -2 id - /db/tables/users
+```
 
 **Multi-way joins** chain through pipes. `-` (or stdin) as the left table
 means "use the result of the previous stage":
 
 ```
-join /db/tables/orders /db/tables/users -on user_id=id | join - /db/tables/products -on product_id=id
+join -1 user_id -2 id /db/tables/orders /db/tables/users | join -1 product_id -2 id - /db/tables/products
 ```
 
 The pipeline optimizer can merge adjacent `JoinTable` operations into a single
@@ -1479,10 +1738,10 @@ a new lead stage.
 
 > **Open: Joins**
 >
-> - Should `-on` support multiple conditions? e.g. `-on user_id=id,org_id=org_id` or repeated `-on` flags?
+> - Should multi-column joins be supported? e.g. `-1 user_id -2 id -1 org_id -2 org_id` (repeated flags)?
 > - For chained joins with `-`, should the optimizer attempt to merge them into one query (requires same driver), or always materialize between stages?
 > - How does `join` interact with non-relational drivers? Graph traversal already expresses joins implicitly via edges. Should `join` on graph paths be an error or silently delegate to graph traversal?
-> - What is the column naming strategy when both tables have a column with the same name? Prefix with table name (`users.name`, `orders.name`)? Or require `-columns` to disambiguate?
+> - What is the column naming strategy when both tables have a column with the same name? Prefix with table name (`users.name`, `orders.name`)? Or require `-o` to disambiguate?
 
 ### Write path
 
@@ -1511,23 +1770,30 @@ successfully inserted rows in stdout.
 
 #### `sed` — partial update
 
-`sed` maps to `UpdateRows`. It finds rows matching a filter and applies a
-partial update (SET semantics — only the specified fields change, the rest
-of the row is preserved).
+`sed` maps to `UpdateRows`. Rows to update are selected via pipe (using
+views, `grep`, or `filter` upstream). `sed` applies the substitution to
+the piped rows.
+
+Like real `sed`, the positional argument is the **expression** — a `s/`
+substitution with the JSON fields to change.
 
 ```
-sed -filter '{"id": 1}' -set '{"name": "Bob"}' /db/tables/users
-sed -filter '{"status": "draft"}' -set '{"status": "published"}' /db/tables/posts
+# Update via view (known filter)
+find /db/tables/users/by_role/admin | sed 's/{"active": false}/'
+
+# Update via filter (ad-hoc field predicate)
+find /db/tables/users | filter 'age < 18' | sed 's/{"restricted": true}/'
+
+# Update via grep (text match)
+find /db/tables/posts | grep draft | sed 's/{"status": "published"}/'
 ```
 
-| Flag      | Meaning                                              |
-|-----------|------------------------------------------------------|
-| `-filter` | JSON predicate — which rows to update (required)     |
-| `-set`    | JSON object — fields to change (required)            |
+`sed` **requires piped input** — it does not accept a bare table path
+without upstream filtering. To update all rows, pipe from `find` directly:
 
-`sed` always requires both `-filter` and `-set`. An unfiltered update
-(`sed -set '{"active":false}' /db/tables/users`) is rejected — updating
-every row requires an explicit `-filter '*'` to prevent accidents.
+```
+find /db/tables/users | sed 's/{"active": false}/'          # all rows
+```
 
 **Type validation** is handled by the driver on the database side. The tool
 layer does no schema validation — it passes the JSON through. Drivers report
@@ -1595,7 +1861,7 @@ not pre-embed.
 > **Open: Write path**
 >
 > - For upsert (`>`), if the table has a composite primary key, does the input JSON need all PK columns present? Or can it match on a subset?
-> - Should `sed` support increment/decrement operations? e.g. `-set '{"views": {"$inc": 1}}'` — or is that too MongoDB-specific?
+> - Should `sed` support increment/decrement operations? e.g. `find ... | filter 'id == 1' | sed 's/{"views": {"$inc": 1}}/'` — or is that too MongoDB-specific?
 > - For vector writes, what happens if the collection's configured dimensions don't match the embedder's output dimensions? Error at write time, or at collection creation time?
 > - Should `Embedder` be configurable per-collection (different models for different collections) or strictly per-session?
 > - How is the "which field to embed" convention established? Collection-level config in `CollectionSpec`? A reserved field name? An explicit flag on `echo`?
@@ -1677,7 +1943,7 @@ impl PgDriver {
 |---|----------|---------|----------|
 | 1 | Result serialization format | Arrow IPC vs native Rust structs vs JSON | TODO |
 | 2 | Python async bridge | pyo3-async-runtimes vs sync wrapper | TODO |
-| 3 | Filter DSL | JSON predicate syntax with `$` operators, parsed into `Filter` enum | Decided |
+| 3 | Filtering approach | Views (directory structure) + Unix composition (grep, pipes) + `filter` command for field predicates | Decided |
 | 4 | VFS schema auto-discovery | Auto on mount vs explicit declaration | TODO |
 | 5 | Persistent cache backend | Redis vs sqlite vs none for v1 | TODO |
 | 6 | `/results/` eviction policy | Session-scoped LRU vs TTL | TODO |
@@ -1721,7 +1987,7 @@ One tool: `dbshell_exec`.
     "properties": {
       "command": {
         "type": "string",
-        "description": "The dbshell command to execute, e.g. 'find /db/tables/users -exec grep {\"active\":true} | sort -k name | less -N 20'"
+        "description": "The dbshell command to execute, e.g. 'find /db/tables/users/by_status/active | sort -k name | head -20'"
       }
     },
     "required": ["command"]
