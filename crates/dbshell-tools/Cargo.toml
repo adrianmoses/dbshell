@@ -1,0 +1,9 @@
+[package]
+name = "dbshell-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dbshell-core.workspace = true
+dbshell-drivers.workspace = true

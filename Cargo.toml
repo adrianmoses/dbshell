@@ -1,2 +1,26 @@
 [workspace]
-members = []
+members = [
+    "crates/dbshell-core",
+    "crates/dbshell-drivers",
+    "crates/dbshell-tools",
+    "crates/dbshell-mcp",
+    "crates/dbshell-py",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+dbshell-core = { path = "crates/dbshell-core" }
+dbshell-drivers = { path = "crates/dbshell-drivers" }
+dbshell-tools = { path = "crates/dbshell-tools" }
