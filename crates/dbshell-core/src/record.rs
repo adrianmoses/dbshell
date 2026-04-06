@@ -92,6 +92,17 @@ pub struct TableQuery {
     pub cursor: Option<String>,
 }
 
+impl TableQuery {
+    /// Merge a filter into the existing filter using AND. If no filter exists,
+    /// the new filter becomes the sole filter.
+    pub fn add_filter(&mut self, filter: Filter) {
+        self.filter = Some(match self.filter.take() {
+            Some(existing) => Filter::And(vec![existing, filter]),
+            None => filter,
+        });
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderBy {
     pub column: String,

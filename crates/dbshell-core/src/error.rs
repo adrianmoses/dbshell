@@ -13,6 +13,8 @@ pub enum DbError {
     InvalidFilter(String),
     InvalidEmbedding(String),
     InvalidPath(String),
+    InvalidState(&'static str),
+    ParseError(String),
     DriverError(Box<dyn std::error::Error + Send + Sync>),
 }
 
@@ -29,6 +31,8 @@ impl fmt::Display for DbError {
             DbError::InvalidFilter(msg) => write!(f, "invalid filter: {msg}"),
             DbError::InvalidEmbedding(msg) => write!(f, "invalid embedding: {msg}"),
             DbError::InvalidPath(msg) => write!(f, "invalid path: {msg}"),
+            DbError::InvalidState(msg) => write!(f, "invalid state: {msg}"),
+            DbError::ParseError(msg) => write!(f, "parse error: {msg}"),
             DbError::DriverError(err) => write!(f, "driver error: {err}"),
         }
     }
@@ -54,6 +58,8 @@ impl DbError {
             DbError::InvalidFilter(_) => 6,
             DbError::InvalidEmbedding(_) => 7,
             DbError::InvalidPath(_) => 8,
+            DbError::InvalidState(_) => 9,
+            DbError::ParseError(_) => 10,
             DbError::DriverError(_) => 127,
         }
     }

@@ -94,3 +94,61 @@ pub enum DbOperation {
     },
     ListResults,
 }
+
+impl DbOperation {
+    /// Whether this operation mutates data (writes, deletes, creates, drops).
+    pub fn is_write(&self) -> bool {
+        matches!(
+            self,
+            DbOperation::Upsert { .. }
+                | DbOperation::Delete { .. }
+                | DbOperation::InsertRows { .. }
+                | DbOperation::UpsertRows { .. }
+                | DbOperation::UpdateRows { .. }
+                | DbOperation::DeleteRows { .. }
+                | DbOperation::CreateCollection { .. }
+                | DbOperation::DropCollection { .. }
+        )
+    }
+
+    /// Extract the driver name from the operation, if present.
+    pub fn driver_name(&self) -> Option<&str> {
+        match self {
+            DbOperation::ListCollections { driver }
+            | DbOperation::InspectCollection { driver, .. }
+            | DbOperation::VectorSearch { driver, .. }
+            | DbOperation::Upsert { driver, .. }
+            | DbOperation::Delete { driver, .. }
+            | DbOperation::GraphQuery { driver, .. }
+            | DbOperation::ListTables { driver }
+            | DbOperation::DescribeTable { driver, .. }
+            | DbOperation::QueryTable { driver, .. }
+            | DbOperation::InsertRows { driver, .. }
+            | DbOperation::UpsertRows { driver, .. }
+            | DbOperation::UpdateRows { driver, .. }
+            | DbOperation::DeleteRows { driver, .. }
+            | DbOperation::MergeTable { driver, .. }
+            | DbOperation::CreateCollection { driver, .. }
+            | DbOperation::DropCollection { driver, .. } => Some(driver),
+            DbOperation::ReadResult { .. } | DbOperation::ListResults => None,
+        }
+    }
+
+    /// Extract the collection or table name targeted by this operation.
+    pub fn collection_or_table(&self) -> Option<&str> {
+        match self {
+            DbOperation::InspectCollection { collection, .. }
+            | DbOperation::VectorSearch { collection, .. }
+            | DbOperation::Upsert { collection, .. }
+            | DbOperation::Delete { collection, .. }
+            | DbOperation::DropCollection { collection, .. } => Some(collection),
+            DbOperation::DescribeTable { table, .. }
+            | DbOperation::QueryTable { table, .. }
+            | DbOperation::InsertRows { table, .. }
+            | DbOperation::UpsertRows { table, .. }
+            | DbOperation::UpdateRows { table, .. }
+            | DbOperation::DeleteRows { table, .. } => Some(table),
+            _ => None,
+        }
+    }
+}

@@ -5,6 +5,7 @@ use crate::filter::Filter;
 use crate::operation::DbOperation;
 use crate::record::TableQuery;
 use crate::search::VectorSearchRequest;
+use crate::tool_kind::ToolKind;
 use crate::vfs_path::{VfsPath, VfsPathKind};
 use crate::view::ViewMount;
 
@@ -41,7 +42,9 @@ impl VirtualFS {
             .ok_or_else(|| DbError::NotFound(format!("symlink: {name}")))
     }
 
-    pub fn resolve(&self, path: &VfsPath, driver: &str) -> Result<DbOperation> {
+    /// Resolve a path + tool intent into a DbOperation. The same path produces
+    /// different operations depending on the tool (ls vs cat vs find).
+    pub fn resolve(&self, path: &VfsPath, driver: &str, tool: &ToolKind) -> Result<DbOperation> {
         // Resolve symlinks first (one level only)
         if let VfsPathKind::Symlink { ref name } = path.kind {
             let target = self
@@ -51,45 +54,88 @@ impl VirtualFS {
             if matches!(target.kind, VfsPathKind::Symlink { .. }) {
                 return Err(DbError::InvalidPath("symlink chains not supported".into()));
             }
-            return self.resolve(target, driver);
+            return self.resolve(target, driver, tool);
         }
 
         let driver = driver.to_string();
 
         match &path.kind {
+            // Root paths: ls and cat both list; find is not meaningful on roots
             VfsPathKind::DbRoot
             | VfsPathKind::VectorRoot
             | VfsPathKind::GraphRoot
             | VfsPathKind::GraphNodeRoot
             | VfsPathKind::GraphEdgeRoot
-            | VfsPathKind::SearchRoot => Ok(DbOperation::ListCollections { driver }),
-
-            VfsPathKind::Collection { name } => Ok(DbOperation::InspectCollection {
-                driver,
-                collection: name.clone(),
-            }),
-            VfsPathKind::GraphNode { label } => Ok(DbOperation::InspectCollection {
-                driver,
-                collection: label.clone(),
-            }),
-            VfsPathKind::GraphEdge { edge_type } => Ok(DbOperation::InspectCollection {
-                driver,
-                collection: edge_type.clone(),
-            }),
-            VfsPathKind::SearchCollection { collection } => Ok(DbOperation::InspectCollection {
-                driver,
-                collection: collection.clone(),
+            | VfsPathKind::SearchRoot => Ok(DbOperation::ListCollections {
+                driver: driver.clone(),
             }),
 
-            VfsPathKind::TableRoot => Ok(DbOperation::ListTables { driver }),
-            VfsPathKind::Table { name } => Ok(DbOperation::DescribeTable {
-                driver,
-                table: name.clone(),
-            }),
+            VfsPathKind::TableRoot => match tool {
+                ToolKind::Ls | ToolKind::Cat => Ok(DbOperation::ListTables { driver }),
+                _ => Ok(DbOperation::ListTables { driver }),
+            },
+
+            // Collections: ls = list contents, cat = inspect schema, find = search
+            VfsPathKind::Collection { name } => match tool {
+                ToolKind::Ls => Ok(DbOperation::ListCollections { driver }),
+                ToolKind::Find => Ok(DbOperation::VectorSearch {
+                    driver,
+                    collection: name.clone(),
+                    request: VectorSearchRequest {
+                        collection: name.clone(),
+                        vector: vec![],
+                        limit: 10,
+                        filter: None,
+                    },
+                }),
+                _ => Ok(DbOperation::InspectCollection {
+                    driver,
+                    collection: name.clone(),
+                }),
+            },
+
+            VfsPathKind::GraphNode { label } => match tool {
+                ToolKind::Ls => Ok(DbOperation::ListCollections { driver }),
+                _ => Ok(DbOperation::InspectCollection {
+                    driver,
+                    collection: label.clone(),
+                }),
+            },
+
+            VfsPathKind::GraphEdge { edge_type } => match tool {
+                ToolKind::Ls => Ok(DbOperation::ListCollections { driver }),
+                _ => Ok(DbOperation::InspectCollection {
+                    driver,
+                    collection: edge_type.clone(),
+                }),
+            },
+
+            VfsPathKind::SearchCollection { collection } => match tool {
+                ToolKind::Ls => Ok(DbOperation::ListCollections { driver }),
+                _ => Ok(DbOperation::InspectCollection {
+                    driver,
+                    collection: collection.clone(),
+                }),
+            },
+
+            // Tables: ls = describe (show views/columns), cat = describe, find = query rows
+            VfsPathKind::Table { name } => match tool {
+                ToolKind::Find => Ok(DbOperation::QueryTable {
+                    driver,
+                    table: name.clone(),
+                    request: TableQuery::default(),
+                }),
+                _ => Ok(DbOperation::DescribeTable {
+                    driver,
+                    table: name.clone(),
+                }),
+            },
+
             VfsPathKind::View { table, .. } => Ok(DbOperation::DescribeTable {
                 driver,
                 table: table.clone(),
             }),
+
             VfsPathKind::ViewEntry { table, view, param } => {
                 let mount = self.find_view(table, view)?;
                 let value = mount.cast_param(param)?;
@@ -105,6 +151,7 @@ impl VirtualFS {
                     },
                 })
             }
+
             VfsPathKind::SearchQuery { collection, .. } => Ok(DbOperation::VectorSearch {
                 driver,
                 collection: collection.clone(),
@@ -115,13 +162,20 @@ impl VirtualFS {
                     filter: None,
                 },
             }),
+
             VfsPathKind::Result { .. } | VfsPathKind::Tmp { .. } => {
                 Ok(DbOperation::ReadResult { path: path.clone() })
             }
+
             VfsPathKind::Symlink { .. } => {
                 unreachable!("symlinks handled above")
             }
         }
+    }
+
+    /// Convenience method that defaults to Cat behavior (backward compat).
+    pub fn resolve_default(&self, path: &VfsPath, driver: &str) -> Result<DbOperation> {
+        self.resolve(path, driver, &ToolKind::Cat)
     }
 
     fn find_view(&self, table: &str, view: &str) -> Result<&ViewMount> {
