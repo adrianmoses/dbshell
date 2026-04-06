@@ -1,5 +1,6 @@
 use dbshell_core::filter::Filter;
 use dbshell_core::operation::DbOperation;
+use dbshell_core::tool_kind::ToolKind;
 use dbshell_core::vfs::VirtualFS;
 use dbshell_core::vfs_path::{VfsPath, VfsPathKind};
 use dbshell_core::view::{ParamType, ViewMount};
@@ -25,7 +26,7 @@ fn vfs_with_views() -> VirtualFS {
 fn test_resolve_db_root() {
     let vfs = VirtualFS::new();
     let path = VfsPath::parse("/db").unwrap();
-    let op = vfs.resolve(&path, "pg").unwrap();
+    let op = vfs.resolve_default(&path, "pg").unwrap();
     assert!(matches!(op, DbOperation::ListCollections { driver } if driver == "pg"));
 }
 
@@ -33,7 +34,7 @@ fn test_resolve_db_root() {
 fn test_resolve_table_root() {
     let vfs = VirtualFS::new();
     let path = VfsPath::parse("/db/tables").unwrap();
-    let op = vfs.resolve(&path, "pg").unwrap();
+    let op = vfs.resolve_default(&path, "pg").unwrap();
     assert!(matches!(op, DbOperation::ListTables { driver } if driver == "pg"));
 }
 
@@ -41,7 +42,7 @@ fn test_resolve_table_root() {
 fn test_resolve_table() {
     let vfs = VirtualFS::new();
     let path = VfsPath::parse("/db/tables/users").unwrap();
-    let op = vfs.resolve(&path, "pg").unwrap();
+    let op = vfs.resolve_default(&path, "pg").unwrap();
     assert!(
         matches!(op, DbOperation::DescribeTable { driver, table } if driver == "pg" && table == "users")
     );
@@ -51,7 +52,7 @@ fn test_resolve_table() {
 fn test_resolve_collection() {
     let vfs = VirtualFS::new();
     let path = VfsPath::parse("/db/vectors/tracks").unwrap();
-    let op = vfs.resolve(&path, "pg").unwrap();
+    let op = vfs.resolve_default(&path, "pg").unwrap();
     assert!(
         matches!(op, DbOperation::InspectCollection { driver, collection } if driver == "pg" && collection == "tracks")
     );
@@ -61,7 +62,7 @@ fn test_resolve_collection() {
 fn test_resolve_view_entry_integer() {
     let vfs = vfs_with_views();
     let path = VfsPath::parse("/db/tables/orders/by_customer/42").unwrap();
-    let op = vfs.resolve(&path, "pg").unwrap();
+    let op = vfs.resolve_default(&path, "pg").unwrap();
 
     match op {
         DbOperation::QueryTable {
@@ -87,7 +88,7 @@ fn test_resolve_view_entry_integer() {
 fn test_resolve_view_entry_string() {
     let vfs = vfs_with_views();
     let path = VfsPath::parse("/db/tables/orders/by_status/shipped").unwrap();
-    let op = vfs.resolve(&path, "pg").unwrap();
+    let op = vfs.resolve_default(&path, "pg").unwrap();
 
     match op {
         DbOperation::QueryTable {
@@ -113,14 +114,14 @@ fn test_resolve_view_entry_string() {
 fn test_resolve_view_entry_bad_cast() {
     let vfs = vfs_with_views();
     let path = VfsPath::parse("/db/tables/orders/by_customer/abc").unwrap();
-    assert!(vfs.resolve(&path, "pg").is_err());
+    assert!(vfs.resolve_default(&path, "pg").is_err());
 }
 
 #[test]
 fn test_resolve_view_not_found() {
     let vfs = VirtualFS::new(); // no views configured
     let path = VfsPath::parse("/db/tables/orders/by_customer/42").unwrap();
-    assert!(vfs.resolve(&path, "pg").is_err());
+    assert!(vfs.resolve_default(&path, "pg").is_err());
 }
 
 #[test]
@@ -135,7 +136,7 @@ fn test_resolve_symlink() {
             name: "my-users".into(),
         },
     };
-    let op = vfs.resolve(&link_path, "pg").unwrap();
+    let op = vfs.resolve_default(&link_path, "pg").unwrap();
     assert!(
         matches!(op, DbOperation::DescribeTable { driver, table } if driver == "pg" && table == "users")
     );
@@ -150,7 +151,7 @@ fn test_resolve_symlink_not_found() {
             name: "nope".into(),
         },
     };
-    assert!(vfs.resolve(&path, "pg").is_err());
+    assert!(vfs.resolve_default(&path, "pg").is_err());
 }
 
 #[test]
@@ -171,6 +172,64 @@ fn test_resolve_symlink_chain_error() {
 fn test_resolve_search_query() {
     let vfs = VirtualFS::new();
     let path = VfsPath::parse("/search/tracks/blue suede shoes").unwrap();
-    let op = vfs.resolve(&path, "pg").unwrap();
+    let op = vfs.resolve_default(&path, "pg").unwrap();
     assert!(matches!(op, DbOperation::VectorSearch { collection, .. } if collection == "tracks"));
+}
+
+// --- Tool-aware resolution tests ---
+
+#[test]
+fn test_resolve_table_ls_describes() {
+    let vfs = VirtualFS::new();
+    let path = VfsPath::parse("/db/tables/users").unwrap();
+    let op = vfs.resolve(&path, "pg", &ToolKind::Ls).unwrap();
+    assert!(
+        matches!(op, DbOperation::DescribeTable { driver, table } if driver == "pg" && table == "users")
+    );
+}
+
+#[test]
+fn test_resolve_table_find_queries() {
+    let vfs = VirtualFS::new();
+    let path = VfsPath::parse("/db/tables/users").unwrap();
+    let op = vfs.resolve(&path, "pg", &ToolKind::Find).unwrap();
+    assert!(
+        matches!(op, DbOperation::QueryTable { driver, table, .. } if driver == "pg" && table == "users")
+    );
+}
+
+#[test]
+fn test_resolve_table_cat_describes() {
+    let vfs = VirtualFS::new();
+    let path = VfsPath::parse("/db/tables/users").unwrap();
+    let op = vfs.resolve(&path, "pg", &ToolKind::Cat).unwrap();
+    assert!(
+        matches!(op, DbOperation::DescribeTable { driver, table } if driver == "pg" && table == "users")
+    );
+}
+
+#[test]
+fn test_resolve_collection_ls_lists() {
+    let vfs = VirtualFS::new();
+    let path = VfsPath::parse("/db/vectors/tracks").unwrap();
+    let op = vfs.resolve(&path, "pg", &ToolKind::Ls).unwrap();
+    assert!(matches!(op, DbOperation::ListCollections { driver } if driver == "pg"));
+}
+
+#[test]
+fn test_resolve_collection_find_searches() {
+    let vfs = VirtualFS::new();
+    let path = VfsPath::parse("/db/vectors/tracks").unwrap();
+    let op = vfs.resolve(&path, "pg", &ToolKind::Find).unwrap();
+    assert!(matches!(op, DbOperation::VectorSearch { collection, .. } if collection == "tracks"));
+}
+
+#[test]
+fn test_resolve_collection_cat_inspects() {
+    let vfs = VirtualFS::new();
+    let path = VfsPath::parse("/db/vectors/tracks").unwrap();
+    let op = vfs.resolve(&path, "pg", &ToolKind::Cat).unwrap();
+    assert!(
+        matches!(op, DbOperation::InspectCollection { collection, .. } if collection == "tracks")
+    );
 }

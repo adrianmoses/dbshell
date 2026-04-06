@@ -5,9 +5,10 @@ use crate::error::{DbError, Result};
 use crate::filter::Filter;
 use crate::graph::{GraphQuery, GraphResult};
 use crate::merge::MergeRequest;
+use crate::operation::DbOperation;
 use crate::record::CollectionInfo;
 use crate::record::{Record, TableInfo, TableQuery, TableSchema};
-use crate::result::ResultSet;
+use crate::result::{ResultSet, ToolPayload};
 use crate::search::{
     CollectionSpec, HealthStatus, ScoredRecord, UpsertResult, VectorSearchRequest,
 };
@@ -80,11 +81,18 @@ pub trait DbDriver: Send + Sync {
 
     // Raw escape hatch
     async fn raw(&self, query: &str, params: serde_json::Value) -> Result<serde_json::Value>;
+
+    /// Begin a new transaction. Returns Unsupported if the driver does not
+    /// support transactions.
+    async fn begin_transaction(&self) -> Result<Box<dyn DriverTransaction>> {
+        Err(DbError::Unsupported("transactions"))
+    }
 }
 
 #[async_trait]
 pub trait DriverTransaction: Send + Sync {
-    async fn execute(&self, query: &str, params: serde_json::Value) -> Result<serde_json::Value>;
+    /// Execute an operation within this transaction.
+    async fn execute(&self, op: &DbOperation) -> Result<ToolPayload>;
     async fn commit(self: Box<Self>) -> Result<()>;
     async fn rollback(self: Box<Self>) -> Result<()>;
 }
